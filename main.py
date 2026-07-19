@@ -3,7 +3,7 @@ import json
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Dict, Any
-from openai import AsyncOpenAI  # Asynchronous client for speed
+from openai import AsyncOpenAI
 
 app = FastAPI()
 
@@ -27,7 +27,7 @@ class CommunityRequest(BaseModel):
     entities: List[str]
     relationships: List[Dict[str, str]]
 
-# --- 0. Health Check Endpoint (Fixes the 404 Log Error) ---
+# --- 0. Health Check Endpoint ---
 @app.get("/")
 async def health_check():
     return {"status": "online", "engine": "GraphRAG Asynchronous AI Engine"}
@@ -36,6 +36,7 @@ async def health_check():
 @app.post("/extract-graph")
 async def extract_graph(req: ExtractRequest):
     try:
+        # Notice the double curly braces {{ }} used below to safely escape the JSON template
         prompt = f"""
         Extract entities and relationships from the text. 
         Allowed Entity Types: Person, Organization, Product, Framework
@@ -45,8 +46,8 @@ async def extract_graph(req: ExtractRequest):
         
         Provide response strictly in this JSON format:
         {{
-          "entities": [{"name": "EntityName", "type": "Type"}],
-          "relationships": [{"source": "SourceName", "target": "TargetName", "relation": "RelationType"}]
+          "entities": [{{ "name": "EntityName", "type": "Type" }}],
+          "relationships": [{{ "source": "SourceName", "target": "TargetName", "relation": "RelationType" }}]
         }}
         """
         
