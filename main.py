@@ -1,5 +1,6 @@
 import os
 import json
+import traceback
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Dict, Any
@@ -13,7 +14,7 @@ client = AsyncOpenAI(
     base_url="https://api.aipipe.org/v1"
 )
 
-# --- Pydantic Models for Input Validation ---
+# --- Pydantic Models ---
 class ExtractRequest(BaseModel):
     chunk_id: str
     text: str
@@ -27,16 +28,27 @@ class CommunityRequest(BaseModel):
     entities: List[str]
     relationships: List[Dict[str, str]]
 
-# --- 0. Health Check Endpoint ---
+# --- Helper: Robust JSON Parser ---
+def parse_llm_json(raw_text: str) -> dict:
+    """Strips Markdown formatting if the LLM hallucinates a code block."""
+    text = raw_text.strip()
+    if text.startswith("```json"):
+        text = text[7:]
+    elif text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    return json.loads(text.strip())
+
+# --- 0. Health Check ---
 @app.get("/")
 async def health_check():
-    return {"status": "online", "engine": "GraphRAG Asynchronous AI Engine"}
+    return {"status": "online", "engine": "GraphRAG Diagnostic Engine"}
 
-# --- 1. Graph Extraction Endpoint ---
+# --- 1. Graph Extraction ---
 @app.post("/extract-graph")
 async def extract_graph(req: ExtractRequest):
     try:
-        # Notice the double curly braces {{ }} used below to safely escape the JSON template
         prompt = f"""
         Extract entities and relationships from the text. 
         Allowed Entity Types: Person, Organization, Product, Framework
@@ -58,11 +70,14 @@ async def extract_graph(req: ExtractRequest):
             temperature=0.0
         )
         
-        return json.loads(response.choices[0].message.content)
+        return parse_llm_json(response.choices[0].message.content)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # This will now print the exact API or Code error to your Render logs
+        error_trace = traceback.format_exc()
+        print(f"EXTRACTION ERROR:\n{error_trace}")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)}")
 
-# --- 2. Graph Query Endpoint ---
+# --- 2. Graph Query ---
 @app.post("/graph-query")
 async def graph_query(req: GraphQueryRequest):
     try:
@@ -87,11 +102,13 @@ async def graph_query(req: GraphQueryRequest):
             temperature=0.0
         )
         
-        return json.loads(response.choices[0].message.content)
+        return parse_llm_json(response.choices[0].message.content)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        error_trace = traceback.format_exc()
+        print(f"QUERY ERROR:\n{error_trace}")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)}")
 
-# --- 3. Community Summarization Endpoint ---
+# --- 3. Community Summarization ---
 @app.post("/community-summary")
 async def community_summary(req: CommunityRequest):
     try:
@@ -115,9 +132,10 @@ async def community_summary(req: CommunityRequest):
             temperature=0.2
         )
         
-        result = json.loads(response.choices[0].message.content)
-        # Explicit override safety net to protect against LLM ID hallucinations
+        result = parse_llm_json(response.choices[0].message.content)
         result["community_id"] = req.community_id
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        error_trace = traceback.format_exc()
+        print(f"SUMMARY ERROR:\n{error_trace}")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)}")
