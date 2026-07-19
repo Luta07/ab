@@ -1,12 +1,20 @@
-import re
-from fastapi import FastAPI
+import os
+import json
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any
-from collections import deque
+from openai import OpenAI
 
 app = FastAPI()
 
-# --- Pydantic Models for Input Validation ---
+# Initialize the client with AIPipe's base URL
+client = OpenAI(
+    api_key=os.environ.get("OPENAI_API_KEY"),
+    base_url="https://api.aipipe.org/v1"  # <--- This routes traffic to AIPipe
+)
+
+# --- 1. Pydantic Models for Input Validation ---
+
 class ExtractRequest(BaseModel):
     chunk_id: str
     text: str
@@ -20,122 +28,102 @@ class CommunityRequest(BaseModel):
     entities: List[str]
     relationships: List[Dict[str, str]]
 
-# --- 1. Graph Extraction (Regex & Heuristics) ---
-@app.post("/extract-graph")
+# --- 2. Pydantic Models for STRICT Output Schemas ---
+
+class Entity(BaseModel):
+    name: str
+    type: str
+
+class Relationship(BaseModel):
+    source: str
+    target: str
+    relation: str
+
+class ExtractionResponse(BaseModel):
+    entities: List[Entity] = Field(default_factory=list)
+    relationships: List[Relationship] = Field(default_factory=list)
+
+class QueryResponse(BaseModel):
+    answer: str
+    reasoning_path: List[str] = Field(default_factory=list)
+    hops: int
+
+class SummaryResponse(BaseModel):
+    community_id: str
+    summary: str
+
+# --- 3. Hardened Endpoints ---
+
+@app.post("/extract-graph", response_model=ExtractionResponse)
 def extract_graph(req: ExtractRequest):
-    text = req.text
-    
-    # Extract capitalized multi-word phrases as entities
-    entity_matches = re.findall(r'\b[A-Z][a-z]+(?:\s[A-Z][a-z]+)*\b', text)
-    unique_entities = list(set(entity_matches))
-    
-    entities = []
-    for e in unique_entities:
-        # Heuristic entity typing based on standard test cases
-        if e in ["LangChain", "OpenAI", "React", "Docker"]:
-            etype = "Framework" if e == "LangChain" else "Organization"
-        elif " " in e:
-            etype = "Person"
-        else:
-            etype = "Product"
-        entities.append({"name": e, "type": etype})
+    try:
+        prompt = f"""
+        You are a strict Graph Extraction system.
+        Extract entities (ONLY types: Person, Organization, Product, Framework) and relationships (ONLY types: FOUNDED, DEVELOPED, INTEGRATED_INTO, HIRED, AUTHORED) from the text.
         
-    relationships = []
-    text_lower = text.lower()
-    
-    # Heuristic relationship mapping
-    if "created" in text_lower or "developed" in text_lower or "authored" in text_lower:
-        rel_type = "DEVELOPED"
-    elif "founded" in text_lower:
-        rel_type = "FOUNDED"
-    elif "integrat" in text_lower:
-        rel_type = "INTEGRATED_INTO"
-    elif "hired" in text_lower:
-        rel_type = "HIRED"
-    else:
-        rel_type = "DEVELOPED" 
+        Text: "{req.text}"
         
-    # Link the first two found entities
-    if len(entities) >= 2:
-        relationships.append({
-            "source": entities[0]["name"],
-            "target": entities[1]["name"],
-            "relation": rel_type
-        })
+        If no relevant entities or relationships exist, return empty lists. Do not invent data.
+        """
         
-    return {
-        "entities": entities,
-        "relationships": relationships
-    }
+        response = client.beta.chat.completions.parse(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            response_format=ExtractionResponse,
+            temperature=0.0
+        )
+        
+        return response.choices[0].message.parsed
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-# --- 2. Graph Query (Breadth-First Search Traversal) ---
-@app.post("/graph-query")
+
+@app.post("/graph-query", response_model=QueryResponse)
 def graph_query(req: GraphQueryRequest):
-    question = req.question.lower()
-    edges = req.graph.get("relationships", [])
-    nodes = req.graph.get("entities", [])
-    
-    # Identify which entities in the graph are mentioned in the question
-    mentioned_nodes = [n["name"] for n in nodes if n["name"].lower() in question]
-    
-    if not edges or not mentioned_nodes:
-        # Safe fallback if parsing fails
-        all_edge_nodes = list(set([e["source"] for e in edges] + [e["target"] for e in edges]))
-        return {
-            "answer": all_edge_nodes[-1] if all_edge_nodes else "Unknown",
-            "reasoning_path": all_edge_nodes[:3],
-            "hops": max(0, len(all_edge_nodes) - 1)
-        }
+    try:
+        prompt = f"""
+        You are a strict Graph Reasoning system. Answer the question using ONLY the provided graph data. 
+        Do not use outside knowledge. If the answer cannot be found in the graph, state "Information not present in graph".
         
-    start_node = mentioned_nodes[0]
-    
-    # Build Adjacency List for the Graph
-    adj = {}
-    for edge in edges:
-        u, v = edge["source"], edge["target"]
-        if u not in adj: adj[u] = []
-        if v not in adj: adj[v] = []
-        adj[u].append(v)
-        adj[v].append(u) # Bidirectional traversal for reasoning
+        Graph Data: {json.dumps(req.graph)}
+        Question: "{req.question}"
         
-    # BFS to find the furthest connected node (the multi-hop answer)
-    queue = deque([(start_node, [start_node])])
-    visited = set([start_node])
-    longest_path = [start_node]
-    
-    while queue:
-        current, path = queue.popleft()
-        if len(path) > len(longest_path):
-            longest_path = path
-            
-        for neighbor in adj.get(current, []):
-            if neighbor not in visited:
-                visited.add(neighbor)
-                queue.append((neighbor, path + [neighbor]))
-                
-    return {
-        "answer": longest_path[-1],
-        "reasoning_path": longest_path,
-        "hops": len(longest_path) - 1
-    }
+        Trace your exact path through the nodes to find the answer. Count the edges traversed as 'hops'.
+        """
+        
+        response = client.beta.chat.completions.parse(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            response_format=QueryResponse,
+            temperature=0.0
+        )
+        
+        return response.choices[0].message.parsed
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-# --- 3. Community Summary (Dynamic Templating) ---
-@app.post("/community-summary")
+
+@app.post("/community-summary", response_model=SummaryResponse)
 def community_summary(req: CommunityRequest):
-    ents = req.entities
-    rels = req.relationships
-    
-    ent_str = ", ".join(ents) if ents else "various distinct entities"
-    
-    if rels:
-        r = rels[0]
-        rel_str = f"notably {r.get('source')} interacting with {r.get('target')} via a {r.get('relation')} relationship"
-    else:
-        rel_str = "sharing complex structural ties"
+    try:
+        prompt = f"""
+        You are a Graph Summarization system. Summarize the following sub-community in 1-2 concise sentences.
+        Focus on how the entities are connected via the relationships.
         
-    summary = f"This community centers around {ent_str}. Key structural interactions include {rel_str}."
-    
-    return {
-        "community_id": req.community_id,
-        "summary": summary
-    }
+        Entities: {json.dumps(req.entities)}
+        Relationships: {json.dumps(req.relationships)}
+        """
+        
+        response = client.beta.chat.completions.parse(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            response_format=SummaryResponse,
+            temperature=0.3 
+        )
+        
+        parsed_response = response.choices[0].message.parsed
+        parsed_response.community_id = req.community_id 
+        
+        return parsed_response
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
